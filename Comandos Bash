@@ -1,0 +1,2 @@
+nvcc -arch=sm_75 FDTD_solver.cu -o FDTD_solver
+./FDTD_solver
