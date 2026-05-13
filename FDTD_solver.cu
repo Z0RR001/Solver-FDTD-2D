@@ -3,24 +3,25 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <chrono>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
 #include <cuda_runtime.h>
 
-// ── Parámetros del dominio ───────────────────────────────────────────────────
-#define NX        512       // celdas en x
-#define NY        512       // celdas en y
-#define NSTEPS    2000      // pasos temporales
-#define PML_THICK 20        // grosor de la PML (celdas)
-#define BLOCK_X   16        // hilos por bloque en x
-#define BLOCK_Y   16        // hilos por bloque en y
+using Clock = std::chrono::high_resolution_clock;
+using Ms    = std::chrono::duration<double, std::milli>;
 
-// Coeficiente de Courant (2D estable con C0 ≤ 1/√2 ≈ 0.707)
-// Con unidades normalizadas: dx=1, dt=0.5 → C0 = dt/dx = 0.5
-#define C0 0.5f
+// ── Parámetros fijos del dominio ─────────────────────────────────────────────
+// NX y NY se reciben por argumento en tiempo de ejecución
+#define NSTEPS    2000
+#define PML_THICK 20
+#define BLOCK_X   16
+#define BLOCK_Y   16
+#define C0        0.5f
 
-// Indexado 2D → 1D row-major (x varía más lento → accesos coalescidos en j)
-#define IDX(i, j) ((i) * NY + (j))
+// IDX usa ny como variable local — todos los kernels y funciones lo reciben
+// como parámetro, por lo que la expansión del macro siempre encuentra ny en scope
+#define IDX(i, j) ((i) * ny + (j))
 
 // ── Macro de verificación de errores CUDA ───────────────────────────────────
 #define CUDA_CHECK(call)                                                        \
@@ -35,16 +36,6 @@
 
 // ============================================================
 //  KERNEL 1: precomputar coeficientes Ca y Cb por celda
-//
-//  Discretización de la ecuación diferencial con pérdidas:
-//    dE/dt = (1/ε)·rot(H) − (σ/ε)·E
-//
-//  Esquema Crank-Nicolson implícito en sigma:
-//    Ca = (ε − σ·Δt/2) / (ε + σ·Δt/2)
-//    Cb = C0 / (ε + σ·Δt/2)
-//
-//  Se lanza UNA SOLA VEZ antes del loop temporal.
-//  Evita divisiones flotantes en cada paso dentro del loop.
 // ============================================================
 __global__ void precompute_coeffs(
     const float* __restrict__ eps,
@@ -58,7 +49,7 @@ __global__ void precompute_coeffs(
     if (i >= nx || j >= ny) return;
 
     int   idx   = IDX(i, j);
-    float denom = eps[idx] + 0.5f * sigma[idx];   // (ε + σΔt/2)
+    float denom = eps[idx] + 0.5f * sigma[idx];
 
     Ca[idx] = (eps[idx] - 0.5f * sigma[idx]) / denom;
     Cb[idx] = C0 / denom;
@@ -66,12 +57,7 @@ __global__ void precompute_coeffs(
 
 // ============================================================
 //  KERNEL 2: actualizar Hz
-//
 //  Hz^{n+½} = Hz^{n-½} + C0 · (∂Ex/∂y − ∂Ey/∂x)
-//
-//  Nota: Hz usa μ_r = 1 (sin materiales magnéticos).
-//  Si necesitás μ_r ≠ 1, basta agregar un coeficiente
-//  análogo a Ca/Cb calculado sobre mu.
 // ============================================================
 __global__ void update_Hz(
     float*       __restrict__ Hz,
@@ -82,19 +68,17 @@ __global__ void update_Hz(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Hz se define en [0, nx-2] × [0, ny-2]
     if (i >= nx - 1 || j >= ny - 1) return;
 
     int idx = IDX(i, j);
     Hz[idx] += C0 * (
-        (Ex[IDX(i, j + 1)] - Ex[idx]) -   // ∂Ex/∂y  (diferencia hacia adelante)
-        (Ey[IDX(i + 1, j)] - Ey[idx])     // ∂Ey/∂x
+        (Ex[IDX(i, j + 1)] - Ex[idx]) -
+        (Ey[IDX(i + 1, j)] - Ey[idx])
     );
 }
 
 // ============================================================
 //  KERNEL 3: actualizar Ex
-//
 //  Ex^{n+1} = Ca · Ex^n + Cb · ∂Hz/∂y
 // ============================================================
 __global__ void update_Ex(
@@ -107,17 +91,15 @@ __global__ void update_Ex(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Ex se actualiza en [0, nx-1] × [1, ny-1]
     if (i >= nx || j < 1 || j >= ny) return;
 
     int idx = IDX(i, j);
     Ex[idx] = Ca[idx] * Ex[idx]
-            + Cb[idx] * (Hz[idx] - Hz[IDX(i, j - 1)]);  // ∂Hz/∂y
+            + Cb[idx] * (Hz[idx] - Hz[IDX(i, j - 1)]);
 }
 
 // ============================================================
 //  KERNEL 4: actualizar Ey
-//
 //  Ey^{n+1} = Ca · Ey^n − Cb · ∂Hz/∂x
 // ============================================================
 __global__ void update_Ey(
@@ -130,22 +112,17 @@ __global__ void update_Ey(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
-    // Ey se actualiza en [1, nx-1] × [0, ny-1]
     if (i < 1 || i >= nx || j >= ny) return;
 
     int idx = IDX(i, j);
     Ey[idx] = Ca[idx] * Ey[idx]
-            - Cb[idx] * (Hz[idx] - Hz[IDX(i - 1, j)]);  // ∂Hz/∂x
+            - Cb[idx] * (Hz[idx] - Hz[IDX(i - 1, j)]);
 }
 
 // ============================================================
 //  KERNEL 5: inyectar fuente gaussiana (soft source)
-//
-//  Se lanza con <<<1,1>>> — solo escribe 1 celda.
-//  "Soft source": suma al campo en lugar de sobreescribir,
-//  permitiendo que la onda reflejada pase sin distorsión.
 // ============================================================
-__global__ void inject_source(float* Hz, int t, int si, int sj)
+__global__ void inject_source(float* Hz, int t, int si, int sj, int ny)
 {
     float pulse = expf(-0.5f * ((t - 40.0f) / 12.0f) * ((t - 40.0f) / 12.0f));
     Hz[IDX(si, sj)] += pulse;
@@ -153,16 +130,6 @@ __global__ void inject_source(float* Hz, int t, int si, int sj)
 
 // ============================================================
 //  KERNEL 6: PML — amortiguación cuadrática en los 4 bordes
-//
-//  En cada celda dentro de la capa PML, se calcula la
-//  distancia al borde más cercano y se aplica un factor
-//  de decaimiento: factor = 1 − α·ρ², con ρ = (pml−dist)/pml
-//
-//  ρ = 0 en el límite interior/PML → factor ≈ 1 (sin cambio)
-//  ρ = 1 en el borde externo       → factor = 1 − α (máx. absorción)
-//
-//  α = 0.35 es un valor empírico que evita reflexión desde
-//  el límite interior sin introducir inestabilidad.
 // ============================================================
 __global__ void apply_pml(
     float* __restrict__ Hz,
@@ -175,7 +142,7 @@ __global__ void apply_pml(
     if (i >= nx || j >= ny) return;
 
     int dist = min(min(i, j), min(nx - 1 - i, ny - 1 - j));
-    if (dist >= pml) return;   // fuera de la PML — no hacer nada
+    if (dist >= pml) return;
 
     float rho    = (float)(pml - 1 - dist) / (float)pml;
     float factor = 1.0f - 0.35f * rho * rho;
@@ -186,132 +153,298 @@ __global__ void apply_pml(
     Ey[idx] *= factor;
 }
 
-// ── Inicializar materiales (CPU) ─────────────────────────────────────────────
-//
-//  Retorna dos vectores: permitividad relativa y conductividad por celda.
-//  Se define la geometría física aquí — fácil de modificar.
-void init_materials(std::vector<float>& eps, std::vector<float>& sigma, int N)
+// ============================================================
+//  FUNCIONES CPU — equivalentes directos de los kernels GPU
+// ============================================================
+
+void cpu_update_Hz(
+    std::vector<float>& Hz,
+    const std::vector<float>& Ex,
+    const std::vector<float>& Ey,
+    int nx, int ny)
 {
-    // Por defecto: aire (ε_r = 1, σ = 0)
+    for (int i = 0; i < nx - 1; i++)
+        for (int j = 0; j < ny - 1; j++) {
+            int idx = IDX(i, j);
+            Hz[idx] += C0 * (
+                (Ex[IDX(i, j + 1)] - Ex[idx]) -
+                (Ey[IDX(i + 1, j)] - Ey[idx])
+            );
+        }
+}
+
+void cpu_update_Ex(
+    std::vector<float>& Ex,
+    const std::vector<float>& Hz,
+    const std::vector<float>& Ca,
+    const std::vector<float>& Cb,
+    int nx, int ny)
+{
+    for (int i = 0; i < nx; i++)
+        for (int j = 1; j < ny; j++) {
+            int idx = IDX(i, j);
+            Ex[idx] = Ca[idx] * Ex[idx]
+                    + Cb[idx] * (Hz[idx] - Hz[IDX(i, j - 1)]);
+        }
+}
+
+void cpu_update_Ey(
+    std::vector<float>& Ey,
+    const std::vector<float>& Hz,
+    const std::vector<float>& Ca,
+    const std::vector<float>& Cb,
+    int nx, int ny)
+{
+    for (int i = 1; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            int idx = IDX(i, j);
+            Ey[idx] = Ca[idx] * Ey[idx]
+                    - Cb[idx] * (Hz[idx] - Hz[IDX(i - 1, j)]);
+        }
+}
+
+void cpu_apply_pml(
+    std::vector<float>& Hz,
+    std::vector<float>& Ex,
+    std::vector<float>& Ey,
+    int nx, int ny, int pml)
+{
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            int dist = std::min({i, j, nx - 1 - i, ny - 1 - j});
+            if (dist >= pml) continue;
+            float rho    = (float)(pml - 1 - dist) / (float)pml;
+            float factor = 1.0f - 0.35f * rho * rho;
+            int   idx    = IDX(i, j);
+            Hz[idx] *= factor;
+            Ex[idx] *= factor;
+            Ey[idx] *= factor;
+        }
+}
+
+// ── Inicializar materiales (CPU) ─────────────────────────────────────────────
+void init_materials(std::vector<float>& eps, std::vector<float>& sigma,
+                    int nx, int ny)
+{
     std::fill(eps.begin(),   eps.end(),   1.0f);
     std::fill(sigma.begin(), sigma.end(), 0.0f);
 
-    // Bloque dieléctrico (tipo vidrio, ε_r = 4)
     for (int i = 280; i < 360; i++)
         for (int j = 180; j < 330; j++)
-            eps[IDX(i, j)] = 4.0f;
+            if (i < nx && j < ny) eps[IDX(i, j)] = 4.0f;
 
-    // Conductor con pérdidas (σ grande → absorbe la onda)
     for (int i = 140; i < 160; i++)
         for (int j = 100; j < 400; j++)
-            sigma[IDX(i, j)] = 5.0f;
+            if (i < nx && j < ny) sigma[IDX(i, j)] = 5.0f;
 }
 
 // ── Guardar snapshot de Hz en formato texto ──────────────────────────────────
-void save_frame(const float* data, int t, const std::string& prefix)
+void save_frame(const float* data, int t, const std::string& prefix,
+                int nx, int ny)
 {
     std::ofstream f(prefix + "_t" + std::to_string(t) + ".dat");
-    for (int i = 0; i < NX; i++) {
-        for (int j = 0; j < NY; j++)
+    for (int i = 0; i < nx; i++) {
+        for (int j = 0; j < ny; j++)
             f << data[IDX(i, j)] << ' ';
         f << '\n';
     }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-int main()
+int main(int argc, char* argv[])
 {
-    const int N = NX * NY;
+    // ── Leer tamaño de grilla desde la línea de comandos ─────────────────────
+    if (argc < 2) {
+        std::cerr << "Uso: " << argv[0] << " <N>\n"
+                  << "Ejemplo: " << argv[0] << " 512\n";
+        return 1;
+    }
+    const int nx = std::atoi(argv[1]);
+    const int ny = nx;   // grilla cuadrada
+    const int N  = nx * ny;
 
-    // ── Materiales en CPU ────────────────────────────────────────────────────
+    std::cout << "Grilla: " << nx << " x " << ny
+              << "  Pasos: " << NSTEPS << "\n\n";
+
+    // ── Materiales ───────────────────────────────────────────────────────────
     std::vector<float> h_eps(N), h_sigma(N);
-    init_materials(h_eps, h_sigma, N);
+    init_materials(h_eps, h_sigma, nx, ny);
 
-    // ── Memoria GPU con Thrust ───────────────────────────────────────────────
+    // ── Precomputar Ca y Cb en CPU ───────────────────────────────────────────
+    //    Los mismos arrays se usan en el bucle CPU y se copian a la GPU.
+    //    No se incluyen en ninguno de los dos timers: son el mismo costo
+    //    para ambas versiones y no forman parte de la simulación iterativa.
+    std::vector<float> h_Ca(N), h_Cb(N);
+    for (int i = 0; i < nx; i++)
+        for (int j = 0; j < ny; j++) {
+            int   idx   = IDX(i, j);
+            float denom = h_eps[idx] + 0.5f * h_sigma[idx];
+            h_Ca[idx]   = (h_eps[idx] - 0.5f * h_sigma[idx]) / denom;
+            h_Cb[idx]   = C0 / denom;
+        }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  BUCLE TEMPORAL — CPU
     //
-    //  thrust::device_vector<float>(N, 0.0f) reemplaza:
-    //    cudaMalloc + cudaMemset + cudaFree (al salir del scope)
+    //  El timer arranca justo antes del primer paso y para justo después
+    //  del último. No incluye init_materials ni precompute.
+    //  Se ejecuta antes de la GPU para que la inicialización del driver
+    //  CUDA no interfiera con el tiempo medido.
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "── CPU ─────────────────────────────────────────────\n";
+
+    std::vector<float> cpu_Hz(N, 0.0f);
+    std::vector<float> cpu_Ex(N, 0.0f);
+    std::vector<float> cpu_Ey(N, 0.0f);
+
+    const int si = nx / 2, sj = ny / 2;
+
+    // ── inicio del timer CPU ──
+    auto cpu_t0 = Clock::now();
+
+    for (int t = 0; t < NSTEPS; t++) {
+        cpu_update_Hz(cpu_Hz, cpu_Ex, cpu_Ey, nx, ny);
+        cpu_update_Ex(cpu_Ex, cpu_Hz, h_Ca, h_Cb, nx, ny);
+        cpu_update_Ey(cpu_Ey, cpu_Hz, h_Ca, h_Cb, nx, ny);
+
+        float pulse = std::exp(
+            -0.5f * ((t - 40.0f) / 12.0f) * ((t - 40.0f) / 12.0f));
+        cpu_Hz[IDX(si, sj)] += pulse;
+
+        cpu_apply_pml(cpu_Hz, cpu_Ex, cpu_Ey, nx, ny, PML_THICK);
+    }
+
+    // ── fin del timer CPU ──
+    double ms_cpu = Ms(Clock::now() - cpu_t0).count();
+
+    std::cout << "Tiempo: " << ms_cpu << " ms\n\n";
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  BUCLE TEMPORAL — GPU (código original sin modificaciones)
     //
-    //  La copia desde host_vector a device_vector (d_eps, d_sigma)
-    //  reemplaza el cudaMemcpy(HostToDevice).
+    //  El timer arranca justo antes del primer lanzamiento de kernel y
+    //  para después de cudaEventSynchronize del último paso.
+    //  Un paso de calentamiento previo descarta el overhead de
+    //  inicialización del contexto CUDA (~50 ms fijos, independientes
+    //  del tamaño de grilla).
+    // ════════════════════════════════════════════════════════════════════════
+    std::cout << "── GPU ─────────────────────────────────────────────\n";
+
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    std::cout << "Dispositivo: " << prop.name << "\n";
+
     thrust::device_vector<float> d_Hz(N, 0.0f);
     thrust::device_vector<float> d_Ex(N, 0.0f);
     thrust::device_vector<float> d_Ey(N, 0.0f);
-    thrust::device_vector<float> d_eps(h_eps);     // copia automática host→device
+    thrust::device_vector<float> d_eps(h_eps);
     thrust::device_vector<float> d_sigma(h_sigma);
-    thrust::device_vector<float> d_Ca(N);
-    thrust::device_vector<float> d_Cb(N);
+    thrust::device_vector<float> d_Ca(h_Ca);
+    thrust::device_vector<float> d_Cb(h_Cb);
 
-    // raw_pointer_cast: obtener float* para pasarlos a los kernels CUDA
-    float* Hz    = thrust::raw_pointer_cast(d_Hz.data());
-    float* Ex    = thrust::raw_pointer_cast(d_Ex.data());
-    float* Ey    = thrust::raw_pointer_cast(d_Ey.data());
-    float* Ca    = thrust::raw_pointer_cast(d_Ca.data());
-    float* Cb    = thrust::raw_pointer_cast(d_Cb.data());
-    float* eps   = thrust::raw_pointer_cast(d_eps.data());
-    float* sigma = thrust::raw_pointer_cast(d_sigma.data());
+    float* Hz = thrust::raw_pointer_cast(d_Hz.data());
+    float* Ex = thrust::raw_pointer_cast(d_Ex.data());
+    float* Ey = thrust::raw_pointer_cast(d_Ey.data());
+    float* Ca = thrust::raw_pointer_cast(d_Ca.data());
+    float* Cb = thrust::raw_pointer_cast(d_Cb.data());
 
-    // ── Configuración de lanzamiento ─────────────────────────────────────────
     dim3 threads(BLOCK_X, BLOCK_Y);
-    // Techo de división: evita perder celdas si NX/NY no es múltiplo de BLOCK
-    dim3 blocks((NX + BLOCK_X - 1) / BLOCK_X,
-                (NY + BLOCK_Y - 1) / BLOCK_Y);
+    dim3 blocks((nx + BLOCK_X - 1) / BLOCK_X,
+                (ny + BLOCK_Y - 1) / BLOCK_Y);
 
-    // ── Precomputar coeficientes (una sola vez) ───────────────────────────────
-    precompute_coeffs<<<blocks, threads>>>(eps, sigma, Ca, Cb, NX, NY);
+    // Calentamiento: fuerza la inicialización del contexto CUDA antes del timer
+    update_Hz<<<blocks, threads>>>(Hz, Ex, Ey, nx, ny);
     CUDA_CHECK(cudaDeviceSynchronize());
-    CUDA_CHECK(cudaGetLastError());
+    thrust::fill(d_Hz.begin(), d_Hz.end(), 0.0f);
+    thrust::fill(d_Ex.begin(), d_Ex.end(), 0.0f);
+    thrust::fill(d_Ey.begin(), d_Ey.end(), 0.0f);
 
-    // Buffer CPU para copias de diagnóstico
+    cudaEvent_t ev_start, ev_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_start));
+    CUDA_CHECK(cudaEventCreate(&ev_stop));
+
     thrust::host_vector<float> h_Hz(N);
 
-    std::cout << "FDTD 2D — " << NX << "×" << NY
-              << " — " << NSTEPS << " pasos\n";
+    // ── inicio del timer GPU ──
+    CUDA_CHECK(cudaEventRecord(ev_start));
 
-    // ── Bucle temporal ────────────────────────────────────────────────────────
     for (int t = 0; t < NSTEPS; t++) {
 
-        // Leapfrog: Hz primero (½ paso), luego E (paso completo)
-        update_Hz   <<<blocks, threads>>>(Hz, Ex, Ey, NX, NY);
-        update_Ex   <<<blocks, threads>>>(Ex, Hz, Ca, Cb, NX, NY);
-        update_Ey   <<<blocks, threads>>>(Ey, Hz, Ca, Cb, NX, NY);
+        update_Hz   <<<blocks, threads>>>(Hz, Ex, Ey, nx, ny);
+        update_Ex   <<<blocks, threads>>>(Ex, Hz, Ca, Cb, nx, ny);
+        update_Ey   <<<blocks, threads>>>(Ey, Hz, Ca, Cb, nx, ny);
+        inject_source<<<1, 1>>>(Hz, t, nx / 2, ny / 2, ny);
+        apply_pml   <<<blocks, threads>>>(Hz, Ex, Ey, nx, ny, PML_THICK);
 
-        // Fuente gaussiana en el centro del dominio
-        inject_source<<<1, 1>>>(Hz, t, NX / 2, NY / 2);
-
-        // PML al final de cada paso (atenúa campos en los bordes)
-        apply_pml   <<<blocks, threads>>>(Hz, Ex, Ey, NX, NY, PML_THICK);
-
-        // Diagnóstico cada 50 pasos: sincronizar, verificar y guardar frame
         if (t % 50 == 0) {
             CUDA_CHECK(cudaDeviceSynchronize());
             CUDA_CHECK(cudaGetLastError());
-
-            // Copia device→host usando Thrust (reemplaza cudaMemcpy)
             h_Hz = d_Hz;
-            save_frame(thrust::raw_pointer_cast(h_Hz.data()), t, "frames/hz");
-
+            save_frame(thrust::raw_pointer_cast(h_Hz.data()), t, "frames/hz",
+                       nx, ny);
             std::cout << "  t = " << t << " / " << NSTEPS << "\r" << std::flush;
         }
     }
 
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // ── fin del timer GPU ──
+    CUDA_CHECK(cudaEventRecord(ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
 
-    // ── Guardar snapshot final (equivalente a hz_output.dat del código original)
+    float ms_gpu = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms_gpu, ev_start, ev_stop));
+
+    std::cout << "\nTiempo: " << ms_gpu << " ms\n\n";
+
+    // ── Snapshot final ───────────────────────────────────────────────────────
     h_Hz = d_Hz;
     {
         std::ofstream f("hz_output.dat");
         const float* data = thrust::raw_pointer_cast(h_Hz.data());
-        for (int i = 0; i < NX; i++) {
-            for (int j = 0; j < NY; j++)
+        for (int i = 0; i < nx; i++) {
+            for (int j = 0; j < ny; j++)
                 f << data[IDX(i, j)] << ' ';
             f << '\n';
         }
     }
 
-    std::cout << "\nSimulación finalizada. Resultado final en hz_output.dat\n";
+    // ════════════════════════════════════════════════════════════════════════
+    //  GUARDAR RESULTADOS EN timing_results.csv
+    //
+    //  Modo append (std::ios::app): si el archivo no existe lo crea con
+    //  encabezado; si ya existe agrega una línea al final.
+    //  Workflow para comparar grillas:
+    //    ./FDTD_solver 256
+    //    ./FDTD_solver 512
+    //    ./FDTD_solver 1024
+    //    → cada ejecución agrega una fila al mismo CSV
+    // ════════════════════════════════════════════════════════════════════════
+    const std::string csv_path = "timing_results.csv";
+    bool file_exists = std::ifstream(csv_path).good();
 
-    // d_Hz, d_Ex, d_Ey, d_Ca, d_Cb, d_eps, d_sigma
-    // se liberan automáticamente al salir del scope (RAII de Thrust)
+    std::ofstream csv(csv_path, std::ios::app);
+    if (!file_exists)
+        csv << "Nx,Ny,Nsteps,cpu_ms,gpu_ms\n";
+
+    csv << nx << ","
+        << ny << ","
+        << NSTEPS << ","
+        << ms_cpu << ","
+        << ms_gpu << "\n";
+    csv.close();
+
+    // ── Reporte en consola ───────────────────────────────────────────────────
+    std::cout << "════════════════════════════════════════════════════\n";
+    std::cout << "  RESUMEN\n";
+    std::cout << "════════════════════════════════════════════════════\n";
+    std::cout << "  Grilla  : " << nx << " x " << ny << "\n";
+    std::cout << "  Pasos   : " << NSTEPS << "\n";
+    std::cout << "  CPU     : " << ms_cpu << " ms\n";
+    std::cout << "  GPU     : " << ms_gpu << " ms\n";
+    std::cout << "  Speedup : " << ms_cpu / ms_gpu << "x\n";
+    std::cout << "  CSV     : " << csv_path << "\n";
+    std::cout << "════════════════════════════════════════════════════\n";
+
+    CUDA_CHECK(cudaEventDestroy(ev_start));
+    CUDA_CHECK(cudaEventDestroy(ev_stop));
     return 0;
 }
