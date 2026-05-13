@@ -19,8 +19,6 @@ using Ms    = std::chrono::duration<double, std::milli>;
 #define BLOCK_Y   16
 #define C0        0.5f
 
-// IDX usa ny como variable local — todos los kernels y funciones lo reciben
-// como parámetro, por lo que la expansión del macro siempre encuentra ny en scope
 #define IDX(i, j) ((i) * ny + (j))
 
 // ── Macro de verificación de errores CUDA ───────────────────────────────────
@@ -120,7 +118,7 @@ __global__ void update_Ey(
 }
 
 // ============================================================
-//  KERNEL 5: inyectar fuente gaussiana (soft source)
+//  KERNEL 5: inyectar fuente gaussiana
 // ============================================================
 __global__ void inject_source(float* Hz, int t, int si, int sj, int ny)
 {
@@ -272,8 +270,6 @@ int main(int argc, char* argv[])
 
     // ── Precomputar Ca y Cb en CPU ───────────────────────────────────────────
     //    Los mismos arrays se usan en el bucle CPU y se copian a la GPU.
-    //    No se incluyen en ninguno de los dos timers: son el mismo costo
-    //    para ambas versiones y no forman parte de la simulación iterativa.
     std::vector<float> h_Ca(N), h_Cb(N);
     for (int i = 0; i < nx; i++)
         for (int j = 0; j < ny; j++) {
@@ -285,11 +281,6 @@ int main(int argc, char* argv[])
 
     // ════════════════════════════════════════════════════════════════════════
     //  BUCLE TEMPORAL — CPU
-    //
-    //  El timer arranca justo antes del primer paso y para justo después
-    //  del último. No incluye init_materials ni precompute.
-    //  Se ejecuta antes de la GPU para que la inicialización del driver
-    //  CUDA no interfiera con el tiempo medido.
     // ════════════════════════════════════════════════════════════════════════
     std::cout << "── CPU ─────────────────────────────────────────────\n";
 
@@ -321,12 +312,6 @@ int main(int argc, char* argv[])
 
     // ════════════════════════════════════════════════════════════════════════
     //  BUCLE TEMPORAL — GPU (código original sin modificaciones)
-    //
-    //  El timer arranca justo antes del primer lanzamiento de kernel y
-    //  para después de cudaEventSynchronize del último paso.
-    //  Un paso de calentamiento previo descarta el overhead de
-    //  inicialización del contexto CUDA (~50 ms fijos, independientes
-    //  del tamaño de grilla).
     // ════════════════════════════════════════════════════════════════════════
     std::cout << "── GPU ─────────────────────────────────────────────\n";
 
@@ -409,14 +394,6 @@ int main(int argc, char* argv[])
 
     // ════════════════════════════════════════════════════════════════════════
     //  GUARDAR RESULTADOS EN timing_results.csv
-    //
-    //  Modo append (std::ios::app): si el archivo no existe lo crea con
-    //  encabezado; si ya existe agrega una línea al final.
-    //  Workflow para comparar grillas:
-    //    ./FDTD_solver 256
-    //    ./FDTD_solver 512
-    //    ./FDTD_solver 1024
-    //    → cada ejecución agrega una fila al mismo CSV
     // ════════════════════════════════════════════════════════════════════════
     const std::string csv_path = "timing_results.csv";
     bool file_exists = std::ifstream(csv_path).good();
