@@ -28,4 +28,11 @@
 module load cuda/10.0.130
 
 #ejecutar el o los binarios con sus respectivos argumentos
-./multmat
+
+nvcc -arch=sm_75 FDTD_solver.cu -o FDTD_solver
+for ((i=9;i<=11;i++))
+do
+    L=$((2**i))
+    echo "Ejecutando simulacion con Grilla=$L"
+    ./FDTD_solver $L
+done
