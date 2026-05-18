@@ -1,9 +1,1 @@
-git clone https://github.com/Z0RR001/Solver-FDTD-2D
-
-nvcc -arch=sm_75 FDTD_solver.cu -o FDTD_solver
-for ((i=9;i<=11;i++))
-do
-    L=$((2**i))
-    echo "Ejecutando simulacion con Grilla=$L"
-    ./FDTD_solver $L
-done
+- git clone https://github.com/Z0RR001/Solver-FDTD-2D
