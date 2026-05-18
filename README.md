@@ -5,6 +5,7 @@
   
 
 - Cargar modulos:
+  
   module load gcc/8.2.0   //es necesario gcc 8.2 porque con otros no compila
   module load cuda/11.4.0
   
