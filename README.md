@@ -82,3 +82,5 @@ El ejemplo anterior ejecutaría simulaciones para los siguientes tamaños de gri
 ## Notas
 
 - La carpeta `frames` debe existir antes de ejecutar el programa para evitar errores.
+- Los códigos de Python se adjuntan para mostrar que existen pero ni la animación ni el gráfico
+  están pensados para correrse en el cluster, sino a lo sumo de manera local con los resultados generados.
