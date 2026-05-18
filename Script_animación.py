@@ -10,9 +10,8 @@ PML      = 20
 INTERVAL = 80
 
 MATERIALES = [
-    {"label": "Vidrio",    "x0": 180, "y0": 280, "w": 80,  "h": 150, "color": "#4CAF50"},
+    {"label": "Vidrio",    "x0": 280, "y0": 180, "w": 80,  "h": 150, "color": "#4CAF50"},
     {"label": "Conductor", "x0": 140, "y0": 100, "w": 20,  "h": 300, "color": "#888888"},
-    {"label": "Ferrita",   "x0": 360, "y0": 320, "w": 60,  "h": 100, "color": "#9C27B0"},
 ]
 
 archivos = sorted(
@@ -35,7 +34,7 @@ im = ax.imshow(frames[0], cmap="RdBu_r", vmin=-vmax, vmax=vmax,
 
 for m in MATERIALES:
     ax.add_patch(patches.Rectangle(
-        (m["y0"], m["x0"]), m["w"], m["h"],
+        (m["x0"], m["y0"]), m["w"], m["h"],
         lw=1.5, edgecolor=m["color"], facecolor=m["color"], alpha=0.2, label=m["label"]
     ))
 
@@ -51,7 +50,7 @@ for xi, yi in [(frames[0].shape[1]//2, frames[0].shape[0]//2),
 fig.colorbar(im, ax=ax, fraction=0.046).set_label("Hz")
 titulo = ax.set_title(os.path.basename(archivos[0]), fontsize=11)
 ax.legend(loc="upper right", fontsize=8, framealpha=0.6)
-ax.set_xlabel("j"); ax.set_ylabel("i")
+ax.set_xlabel("X"); ax.set_ylabel("Y")
 plt.tight_layout()
 
 def update(fi):
